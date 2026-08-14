@@ -220,12 +220,13 @@ function hashToken(token) {
  * Set refresh token as an httpOnly cookie.
  */
 function setRefreshCookie(res, token) {
+  const isProd = process.env.NODE_ENV === 'production';
   res.cookie('refreshToken', token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',                           // 'lax' allows cookies on page navigation/refresh
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',           // 'none' is required for cross-origin HTTPS (Render frontend -> Render API)
     maxAge: 7 * 24 * 60 * 60 * 1000,           // 7 days in ms
-    path: '/',                                  // sent on all routes (needed for proxy setups)
+    path: '/',                                  // sent on all routes
   });
 }
 

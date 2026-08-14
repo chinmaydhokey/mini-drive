@@ -8,13 +8,27 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const initCalled = useRef(false);
 
-  // Try to restore session on mount (via refresh token cookie)
+  // Try to restore session on mount (via stored access token or refresh token cookie)
   useEffect(() => {
     if (initCalled.current) return; // Guard against StrictMode double-mount
     initCalled.current = true;
 
     const initAuth = async () => {
       try {
+        // 1. If we have a stored access token, try getMe() directly
+        const storedToken = getAccessToken();
+        if (storedToken) {
+          try {
+            const me = await authAPI.getMe();
+            setUser(me.data.data.user);
+            setLoading(false);
+            return;
+          } catch {
+            // Access token might be expired, proceed to refresh
+          }
+        }
+
+        // 2. Try to refresh access token using cookie / endpoint
         const { data } = await authAPI.refresh();
         setAccessToken(data.data.accessToken);
         const me = await authAPI.getMe();

@@ -7,12 +7,24 @@ const api = axios.create({
   withCredentials: true, // send cookies (refresh token)
 });
 
-// ── Token management (in-memory only — not localStorage) ─────
+// ── Token management (persisted in localStorage + in-memory) ──
 let accessToken = null;
+try {
+  accessToken = localStorage.getItem('minidrive_access_token') || null;
+} catch {}
 
-export const setAccessToken = (token) => { accessToken = token; };
+export const setAccessToken = (token) => {
+  accessToken = token;
+  try {
+    if (token) localStorage.setItem('minidrive_access_token', token);
+    else localStorage.removeItem('minidrive_access_token');
+  } catch {}
+};
 export const getAccessToken = () => accessToken;
-export const clearAccessToken = () => { accessToken = null; };
+export const clearAccessToken = () => {
+  accessToken = null;
+  try { localStorage.removeItem('minidrive_access_token'); } catch {}
+};
 
 // ── Request interceptor: attach JWT ──────────────────────────
 api.interceptors.request.use((config) => {
