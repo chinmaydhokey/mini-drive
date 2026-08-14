@@ -1,40 +1,65 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import { authAPI, setAccessToken, clearAccessToken } from '../services/api';
+import { authAPI, setAccessToken, getAccessToken, clearAccessToken } from '../services/api';
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
+  // Initialize user from localStorage to prevent redirecting to /login on refresh
+  const [user, setUser] = useState(() => {
+    try {
+      const savedUser = localStorage.getItem('minidrive_user');
+      return savedUser ? JSON.parse(savedUser) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  // If we already have a saved token, don't block the screen with full loading
+  const [loading, setLoading] = useState(() => {
+    try {
+      return !localStorage.getItem('minidrive_access_token');
+    } catch {
+      return true;
+    }
+  });
+
   const initCalled = useRef(false);
 
-  // Try to restore session on mount (via stored access token or refresh token cookie)
+  // Re-verify session in background on mount
   useEffect(() => {
-    if (initCalled.current) return; // Guard against StrictMode double-mount
+    if (initCalled.current) return;
     initCalled.current = true;
 
     const initAuth = async () => {
       try {
-        // 1. If we have a stored access token, try getMe() directly
         const storedToken = getAccessToken();
         if (storedToken) {
           try {
             const me = await authAPI.getMe();
             setUser(me.data.data.user);
+            try {
+              localStorage.setItem('minidrive_user', JSON.stringify(me.data.data.user));
+            } catch {}
             setLoading(false);
             return;
           } catch {
-            // Access token might be expired, proceed to refresh
+            // Stored access token may be expired, attempt refresh below
           }
         }
 
-        // 2. Try to refresh access token using cookie / endpoint
+        // Attempt refresh
         const { data } = await authAPI.refresh();
         setAccessToken(data.data.accessToken);
         const me = await authAPI.getMe();
         setUser(me.data.data.user);
+        try {
+          localStorage.setItem('minidrive_user', JSON.stringify(me.data.data.user));
+        } catch {}
       } catch {
         clearAccessToken();
+        try {
+          localStorage.removeItem('minidrive_user');
+        } catch {}
         setUser(null);
       } finally {
         setLoading(false);
@@ -47,6 +72,9 @@ export function AuthProvider({ children }) {
     const { data } = await authAPI.login({ email, password });
     setAccessToken(data.data.accessToken);
     setUser(data.data.user);
+    try {
+      localStorage.setItem('minidrive_user', JSON.stringify(data.data.user));
+    } catch {}
     return data.data.user;
   }, []);
 
@@ -54,12 +82,18 @@ export function AuthProvider({ children }) {
     const { data } = await authAPI.register({ email, username, password });
     setAccessToken(data.data.accessToken);
     setUser(data.data.user);
+    try {
+      localStorage.setItem('minidrive_user', JSON.stringify(data.data.user));
+    } catch {}
     return data.data.user;
   }, []);
 
   const logout = useCallback(async () => {
     try { await authAPI.logout(); } catch {}
     clearAccessToken();
+    try {
+      localStorage.removeItem('minidrive_user');
+    } catch {}
     setUser(null);
   }, []);
 
