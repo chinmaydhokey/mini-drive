@@ -1,0 +1,184 @@
+# ── MiniDrive — Docker Compose ─────────────────────────────────
+# Full distributed file system stack:
+#   MongoDB, Redis, Metadata Service, 3 Storage Nodes,
+#   2 API Servers, Frontend, Nginx Load Balancer
+
+services:
+  # ── Data Stores ─────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Metadata Service ────────────────────────────────────────
+  metadata:
+    build:
+      context: ./services/metadata-service
+      dockerfile: ../../docker/Dockerfile.metadata
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - METADATA_PORT=4000
+      - MONGODB_URI=mongodb://mongo:27017/minidrive
+      - REPLICATION_FACTOR=3
+      - CHUNK_SIZE=4194304
+      - STORAGE_NODES=["http://storage-1:5001","http://storage-2:5002","http://storage-3:5003"]
+      - HEARTBEAT_INTERVAL=10000
+      - OFFLINE_THRESHOLD=30000
+      - HEALTH_CHECK_INTERVAL=15000
+      - REPLICATION_INTERVAL=20000
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  # ── Storage Nodes ───────────────────────────────────────────
+  storage-1:
+    build:
+      context: ./services/storage-node
+      dockerfile: ../../docker/Dockerfile.storage
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      - NODE_ID=node-1
+      - METADATA_URL=http://metadata:4000
+    volumes:
+      - storage_1_data:/app/data
+    depends_on:
+      - metadata
+
+  storage-2:
+    build:
+      context: ./services/storage-node
+      dockerfile: ../../docker/Dockerfile.storage
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    environment:
+      - PORT=5002
+      - NODE_ID=node-2
+      - METADATA_URL=http://metadata:4000
+    volumes:
+      - storage_2_data:/app/data
+    depends_on:
+      - metadata
+
+  storage-3:
+    build:
+      context: ./services/storage-node
+      dockerfile: ../../docker/Dockerfile.storage
+    restart: unless-stopped
+    ports:
+      - "5003:5003"
+    environment:
+      - PORT=5003
+      - NODE_ID=node-3
+      - METADATA_URL=http://metadata:4000
+    volumes:
+      - storage_3_data:/app/data
+    depends_on:
+      - metadata
+
+  # ── API Servers (load-balanced pair) ────────────────────────
+  api-1:
+    build:
+      context: ./services/api-server
+      dockerfile: ../../docker/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongo:27017/minidrive
+      - REDIS_URL=redis://redis:6379
+      - METADATA_URL=http://metadata:4000
+      - FRONTEND_URL=http://localhost
+      - JWT_ACCESS_SECRET=${JWT_ACCESS_SECRET:-prod-access-secret-change-me}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET:-prod-refresh-secret-change-me}
+      - JWT_ACCESS_EXPIRY=15m
+      - JWT_REFRESH_EXPIRY=7d
+    volumes:
+      - api_uploads:/app/uploads
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      metadata:
+        condition: service_started
+
+  api-2:
+    build:
+      context: ./services/api-server
+      dockerfile: ../../docker/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongo:27017/minidrive
+      - REDIS_URL=redis://redis:6379
+      - METADATA_URL=http://metadata:4000
+      - FRONTEND_URL=http://localhost
+      - JWT_ACCESS_SECRET=${JWT_ACCESS_SECRET:-prod-access-secret-change-me}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET:-prod-refresh-secret-change-me}
+      - JWT_ACCESS_EXPIRY=15m
+      - JWT_REFRESH_EXPIRY=7d
+    volumes:
+      - api_uploads:/app/uploads
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      metadata:
+        condition: service_started
+
+  # ── Frontend ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: ../../docker/Dockerfile.frontend
+    restart: unless-stopped
+
+  # ── Nginx Load Balancer ─────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+      - frontend
+
+volumes:
+  mongo_data:
+  redis_data:
+  storage_1_data:
+  storage_2_data:
+  storage_3_data:
+  api_uploads:

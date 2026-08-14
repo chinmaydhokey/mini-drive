@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+dist/
+build/
+
+# Uploads (local dev storage)
+services/api-server/uploads/*
+!services/api-server/uploads/.gitkeep
+
+# Docker
+docker/data/
+
+# Coverage
+coverage/
+
+# Scratch & temporary test files
+scratch/
+testfile.txt
+test-results/
+.playwright-mcp/
+.qodo/
+
+# Storage Node Data
+services/storage-node/data/
+services/metadata-service/data/
