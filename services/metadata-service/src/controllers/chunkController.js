@@ -39,7 +39,46 @@ const uploadChunk = async (req, res) => {
 
     const chunkBuffer = req.file.buffer;
     const chunkSize = chunkBuffer.length;
-    const chunkHash = crypto.createHash('sha256').update(chunkBuffer).digest('hex');
+    const chunkHash = req.body.chunkHash || crypto.createHash('sha256').update(chunkBuffer).digest('hex');
+
+    // CAS Dedup: check if a chunk with this hash already exists
+    const existingChunk = await Chunk.findOne({ chunkHash });
+    if (existingChunk) {
+      // Increment refCount — this chunk is shared
+      existingChunk.refCount = (existingChunk.refCount || 1) + 1;
+      await existingChunk.save();
+      
+      // Create a mapping record for this fileId+chunkIndex pointing to existing chunk
+      // We create a new Chunk doc that references the same physical storage
+      const mappedChunk = await Chunk.create({
+        fileId,
+        chunkIndex: parseInt(chunkIndex, 10),
+        chunkSize: existingChunk.chunkSize,
+        chunkHash,
+        chunkId: existingChunk.chunkId, // same physical chunk
+        replicas: existingChunk.replicas,
+        status: existingChunk.status,
+        s3Backed: existingChunk.s3Backed,
+        s3BackedAt: existingChunk.s3BackedAt,
+        refCount: 0, // not the primary owner
+        isDedupRef: true, // marks this as a reference, not primary
+      });
+      
+      return res.status(201).json({
+        success: true,
+        data: {
+          chunkId: existingChunk.chunkId,
+          chunkIndex: mappedChunk.chunkIndex,
+          chunkSize: existingChunk.chunkSize,
+          chunkHash,
+          replicaCount: existingChunk.replicas.length,
+          status: 'DEDUPED',
+          deduplicated: true,
+          bytesSaved: existingChunk.chunkSize,
+        },
+      });
+    }
+
     const chunkId = `${fileId}_chunk_${chunkIndex}_${uuidv4().slice(0, 8)}`;
 
     // Select target nodes
@@ -242,6 +281,13 @@ const deleteChunks = async (req, res) => {
 
     for (const chunk of chunks) {
       // 1. Delete chunk from all registered storage node replicas
+      const otherRefsCount = await Chunk.countDocuments({ chunkId: chunk.chunkId, _id: { $ne: chunk._id } });
+      if (otherRefsCount > 0) {
+        console.log(`  🔗 [Dedup] Skipping physical deletion for chunk ${chunk.chunkId} (used by ${otherRefsCount} other files)`);
+        await Chunk.updateOne({ chunkId: chunk.chunkId, isDedupRef: false }, { $inc: { refCount: -1 } });
+        continue;
+      }
+
       for (const replica of chunk.replicas) {
         try {
           await axios.delete(`${replica.nodeUrl}/chunks/${chunk.chunkId}`, { timeout: 5000 });
@@ -292,4 +338,43 @@ const deleteChunks = async (req, res) => {
   }
 };
 
-module.exports = { uploadChunk, getChunkMap, downloadChunk, deleteChunks };
+/**
+ * POST /api/chunks/check-dedup
+ * Check which chunk hashes already exist in the system.
+ * Body: { hashes: ['sha256hash1', 'sha256hash2', ...] }
+ * Returns: { existing: { 'sha256hash1': { chunkId, chunkSize }, ... }, missing: ['sha256hash3'] }
+ */
+const checkDedup = async (req, res) => {
+  try {
+    const { hashes } = req.body;
+    if (!Array.isArray(hashes)) {
+      return res.status(400).json({ success: false, error: 'hashes must be an array' });
+    }
+    
+    const existing = {};
+    const missing = [];
+    
+    const chunks = await Chunk.find({ chunkHash: { $in: hashes } }).select('chunkHash chunkId chunkSize replicas status s3Backed s3BackedAt');
+    const hashMap = new Map();
+    for (const c of chunks) {
+      if (!hashMap.has(c.chunkHash)) {
+        hashMap.set(c.chunkHash, c);
+      }
+    }
+    
+    for (const hash of hashes) {
+      if (hashMap.has(hash)) {
+        const c = hashMap.get(hash);
+        existing[hash] = { chunkId: c.chunkId, chunkSize: c.chunkSize };
+      } else {
+        missing.push(hash);
+      }
+    }
+    
+    res.json({ success: true, data: { existing, missing } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+module.exports = { uploadChunk, getChunkMap, downloadChunk, deleteChunks, checkDedup };

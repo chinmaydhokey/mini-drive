@@ -29,8 +29,9 @@ const chunkSchema = new mongoose.Schema(
     chunkId: {
       type: String, // Unique ID used as filename on storage nodes
       required: true,
-      unique: true,
     },
+    refCount: { type: Number, default: 1 },
+    isDedupRef: { type: Boolean, default: false },
     replicas: [replicaSchema],
     status: {
       type: String,
@@ -53,6 +54,8 @@ const chunkSchema = new mongoose.Schema(
 chunkSchema.index({ fileId: 1, chunkIndex: 1 }, { unique: true });
 chunkSchema.index({ status: 1 });
 chunkSchema.index({ 'replicas.nodeId': 1 });
+chunkSchema.index({ chunkHash: 1 });
+chunkSchema.index({ chunkId: 1 });
 
 const Chunk = mongoose.model('Chunk', chunkSchema);
 module.exports = Chunk;

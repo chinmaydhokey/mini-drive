@@ -12,6 +12,7 @@ import {
   HiOutlineLockClosed, HiOutlineGlobeAlt, HiOutlineUserPlus, HiOutlineXMark,
 } from 'react-icons/hi2';
 import { filesAPI, foldersAPI, sharesAPI, bulkAPI } from '../services/api';
+import UploadManager from '../components/UploadManager';
 
 function getFileIcon(mimeType, isFolder) {
   if (isFolder) return { icon: HiOutlineFolder, cls: 'file-type-folder' };
@@ -53,6 +54,10 @@ export default function Dashboard() {
   const [shareModal, setShareModal] = useState(null);
   const [versionModal, setVersionModal] = useState(null);
   
+  // Chunked upload state
+  const [pendingChunkedFiles, setPendingChunkedFiles] = useState([]);
+  const CHUNKED_THRESHOLD = 10 * 1024 * 1024; // 10 MB — files above this use chunked upload
+  
   // Selection state
   const [selectedItems, setSelectedItems] = useState(new Set());
   const [lastSelected, setLastSelected] = useState(null);
@@ -89,7 +94,31 @@ export default function Dashboard() {
 
   // ── Upload via dropzone ────────────────────────────────────
   const onDrop = useCallback(async (files) => {
+    const smallFiles = [];
+    const largeFiles = [];
+
     for (const file of files) {
+      if (file.size > CHUNKED_THRESHOLD) {
+        largeFiles.push(file);
+      } else {
+        smallFiles.push(file);
+      }
+    }
+
+    // Large files → chunked upload engine (via UploadManager)
+    if (largeFiles.length > 0) {
+      setPendingChunkedFiles(prev => [
+        ...prev,
+        ...largeFiles.map(file => ({
+          file,
+          folderId: folderId !== 'root' ? folderId : undefined,
+          encrypt: false,
+        })),
+      ]);
+    }
+
+    // Small files → simple single-request upload (existing path)
+    for (const file of smallFiles) {
       const formData = new FormData();
       formData.append('file', file);
       if (folderId !== 'root') formData.append('folderId', folderId);
@@ -105,7 +134,7 @@ export default function Dashboard() {
       }
     }
     setUploadProgress(null);
-    loadFolder();
+    if (smallFiles.length > 0) loadFolder();
   }, [folderId, loadFolder]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -301,6 +330,74 @@ export default function Dashboard() {
   const handleDownload = async (file) => {
     setContextMenu(null);
     try {
+      // If file is encrypted, decrypt client-side
+      if (file.isEncrypted) {
+        const password = prompt('Enter vault password to decrypt this file:');
+        if (!password) return;
+
+        const { deriveKey, decryptChunk, base64ToBytes } = await import('../services/cryptoEngine');
+
+        toast('Decrypting file...', { icon: '🔐', duration: 2000 });
+
+        // Get file metadata (includes encryptionSalt and chunkIVs)
+        const { data: metaRes } = await filesAPI.get(file._id);
+        const fileMeta = metaRes.data.file;
+
+        if (!fileMeta.encryptionSalt || !fileMeta.chunkIVs?.length) {
+          toast.error('Missing encryption metadata. File may not be decryptable.');
+          return;
+        }
+
+        const salt = base64ToBytes(fileMeta.encryptionSalt);
+        const key = await deriveKey(password, salt);
+
+        // Download and decrypt each chunk
+        const decryptedParts = [];
+        for (let i = 0; i < (fileMeta.totalChunks || fileMeta.chunkIVs.length); i++) {
+          const { data: chunkBlob } = await filesAPI.download(file._id);
+          // For chunked files, we download the whole reassembled file from the server
+          // and decrypt it chunk-by-chunk based on the IVs
+          // But since the server streams all chunks concatenated, we handle it differently:
+          break; // will use single download approach below
+        }
+
+        // Download entire (encrypted) file as blob
+        const { data: encBlob } = await filesAPI.download(file._id);
+        const encBuffer = await encBlob.arrayBuffer();
+
+        // If file has chunk IVs, decrypt chunk by chunk
+        const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB (must match upload chunk size)
+        const GCM_TAG_SIZE = 16; // AES-GCM auth tag appended by encrypt
+        const chunkIVs = fileMeta.chunkIVs;
+        const parts = [];
+        let offset = 0;
+
+        for (let i = 0; i < chunkIVs.length; i++) {
+          const iv = base64ToBytes(chunkIVs[i]);
+          // Each encrypted chunk = original chunk + 16 byte GCM tag
+          const encChunkSize = Math.min(CHUNK_SIZE, fileMeta.size - (i * CHUNK_SIZE)) + GCM_TAG_SIZE;
+          const encChunk = encBuffer.slice(offset, offset + encChunkSize);
+          offset += encChunkSize;
+
+          try {
+            const decrypted = await decryptChunk(key, encChunk, iv);
+            parts.push(new Uint8Array(decrypted));
+          } catch {
+            toast.error('Decryption failed — wrong password?');
+            return;
+          }
+        }
+
+        const decryptedBlob = new Blob(parts, { type: file.mimeType });
+        const url = URL.createObjectURL(decryptedBlob);
+        const a = document.createElement('a');
+        a.href = url; a.download = file.filename || file.originalName; a.click();
+        URL.revokeObjectURL(url);
+        toast.success('File decrypted and downloaded!');
+        return;
+      }
+
+      // Normal (unencrypted) download
       const { data } = await filesAPI.download(file._id);
       const url = URL.createObjectURL(data);
       const a = document.createElement('a');
@@ -468,6 +565,23 @@ export default function Dashboard() {
             <input type="file" multiple style={{ display: 'none' }}
               onChange={(e) => onDrop(Array.from(e.target.files))} />
           </label>
+          <label className="btn btn-secondary" style={{ cursor: 'pointer' }} title="Upload with encryption (Zero-Knowledge Vault)">
+            <HiOutlineLockClosed /> Encrypted Upload
+            <input type="file" multiple style={{ display: 'none' }}
+              onChange={(e) => {
+                const files = Array.from(e.target.files);
+                if (files.length > 0) {
+                  setPendingChunkedFiles(prev => [
+                    ...prev,
+                    ...files.map(file => ({
+                      file,
+                      folderId: folderId !== 'root' ? folderId : undefined,
+                      encrypt: true,
+                    })),
+                  ]);
+                }
+              }} />
+          </label>
         </div>
       </div>
 
@@ -526,9 +640,13 @@ export default function Dashboard() {
                     <HiOutlineCheckCircle size={20} />
                   </div>
                   <div className={`file-card-icon ${cls}`}><Icon /></div>
-                  <div className="file-card-name">{file.filename}</div>
+                  <div className="file-card-name">
+                    {file.isEncrypted && <HiOutlineLockClosed style={{ color: '#f0a500', fontSize: 13, marginRight: 4, verticalAlign: 'text-bottom' }} />}
+                    {file.filename}
+                  </div>
                   <div className="file-card-meta">
                     {formatSize(file.size)} · v{file.currentVersion} · {formatDate(file.createdAt)}
+                    {file.isEncrypted && <span style={{ color: '#f0a500', marginLeft: 4 }}>🔐</span>}
                   </div>
                   <div className="file-card-actions">
                     <button className="btn btn-icon btn-ghost"
@@ -634,6 +752,16 @@ export default function Dashboard() {
 
       {/* Version history modal */}
       {versionModal && <VersionModal file={versionModal} onClose={() => setVersionModal(null)} onRefresh={loadFolder} />}
+
+      {/* Chunked Upload Manager (Google Drive-style progress panel) */}
+      <UploadManager
+        pendingFiles={pendingChunkedFiles}
+        onClearPending={() => setPendingChunkedFiles([])}
+        onUploadComplete={() => {
+          loadFolder();
+          toast.success('Chunked upload complete!');
+        }}
+      />
     </div>
   );
 }

@@ -131,6 +131,18 @@ export const filesAPI = {
     }),
   downloadVersion: (id, vNum) => api.get(`/files/${id}/versions/${vNum}/download`, { responseType: 'blob' }),
   restoreVersion: (id, vNum) => api.post(`/files/${id}/versions/${vNum}/restore`),
+  // Resumable chunked upload
+  uploadInit: (data) => api.post('/files/upload/init', data),
+  uploadChunk: (formData, signal) =>
+    api.post('/files/upload/chunk', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 60000,
+      signal,
+    }),
+  uploadComplete: (data) => api.post('/files/upload/complete', data),
+  uploadStatus: (fileId) => api.get(`/files/upload/status/${fileId}`),
 };
 
 // ── Folders API ──────────────────────────────────────────────

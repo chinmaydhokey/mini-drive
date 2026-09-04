@@ -67,6 +67,9 @@ const fileSchema = new mongoose.Schema(
 
     // --- Phase 6: Chunking fields (unused until then) ---
     totalChunks: { type: Number, default: 0 },
+    dedupSavings: { type: Number, default: 0 },       // bytes saved via deduplication
+    encryptionSalt: { type: String, default: null },   // PBKDF2 salt for key derivation
+    chunkIVs: { type: [String], default: [] },         // AES-GCM IV per chunk (base64)
 
     // --- Extension points (future phases) ---
     sha256Hash: { type: String, default: null },      // Phase 14: dedup

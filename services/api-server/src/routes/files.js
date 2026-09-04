@@ -3,8 +3,9 @@ const router = express.Router();
 
 const fileController = require('../controllers/fileController');
 const versionController = require('../controllers/versionController');
+const resumableUploadController = require('../controllers/resumableUploadController');
 const { authenticate } = require('../middleware/auth');
-const { uploadSingle } = require('../middleware/upload');
+const { uploadSingle, uploadChunkSingle } = require('../middleware/upload');
 const { ensureUploadDir } = require('../middleware/ensureUploadDir');
 
 // All file routes require authentication
@@ -18,6 +19,12 @@ router.post(
   uploadSingle,
   fileController.uploadFile
 );
+
+// ── Resumable Upload ─────────────────────────────────────────
+router.post('/upload/init', resumableUploadController.initUpload);
+router.post('/upload/chunk', uploadChunkSingle, resumableUploadController.uploadChunk);
+router.post('/upload/complete', resumableUploadController.completeUpload);
+router.get('/upload/status/:fileId', resumableUploadController.getUploadStatus);
 
 // ── Storage Stats (must be before /:id to avoid matching "storage" as an ID) ──
 router.get('/storage', fileController.getStorageStats);

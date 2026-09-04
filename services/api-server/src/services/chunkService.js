@@ -127,10 +127,30 @@ async function deleteChunks(fileId) {
   }
 }
 
+/**
+ * Check which chunk hashes already exist in the metadata service (for CAS dedup).
+ * @param {string[]} hashes - Array of SHA-256 hex strings
+ * @returns {Promise<{ existing: Object, missing: string[] }>}
+ */
+async function checkDedup(hashes) {
+  try {
+    const response = await axios.post(`${METADATA_URL}/api/chunks/check-dedup`, { hashes }, { timeout: 10000 });
+    if (response.data?.success) {
+      return response.data.data;
+    }
+    throw new Error(response.data?.error || 'Failed to check dedup');
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    console.error(`❌ Error checking dedup: ${errMsg}`);
+    throw new AppError(`Dedup check failed: ${errMsg}`, 500);
+  }
+}
+
 module.exports = {
   processAndUploadChunks,
   getChunkMap,
   getChunkStream,
   deleteChunks,
+  checkDedup,
   CHUNK_SIZE,
 };

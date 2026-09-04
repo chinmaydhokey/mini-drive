@@ -74,4 +74,29 @@ const uploadSingle = (req, res, next) => {
   });
 };
 
-module.exports = { uploadSingle };
+// ── Chunk upload (in-memory buffer for forwarding to metadata service) ──
+const chunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5 MB max per chunk
+    files: 1,
+  },
+});
+
+const uploadChunkSingle = (req, res, next) => {
+  chunkUpload.single('chunk')(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return next(new AppError('Chunk size exceeds the 5 MB limit.', 400));
+      }
+      return next(new AppError(`Chunk upload error: ${err.message}`, 400));
+    }
+    if (err) return next(err);
+    if (!req.file) {
+      return next(new AppError('No chunk data provided. Use form field name "chunk".', 400));
+    }
+    next();
+  });
+};
+
+module.exports = { uploadSingle, uploadChunkSingle };
