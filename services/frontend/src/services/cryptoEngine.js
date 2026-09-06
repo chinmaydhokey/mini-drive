@@ -125,3 +125,38 @@ export async function sha256(buffer) {
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
+
+/**
+ * Decrypt an entire encrypted file array buffer chunk by chunk.
+ * @param {ArrayBuffer} encBuffer - The raw encrypted bytes received from server
+ * @param {Object} fileMeta - File metadata containing size, encryptionSalt, chunkIVs, mimeType
+ * @param {string} password - User's vault password
+ * @returns {Promise<Blob>} Decrypted file as Blob
+ */
+export async function decryptFileBuffer(encBuffer, fileMeta, password) {
+  if (!fileMeta.encryptionSalt || !fileMeta.chunkIVs?.length) {
+    throw new Error('Missing encryption metadata. File cannot be decrypted.');
+  }
+
+  const salt = base64ToBytes(fileMeta.encryptionSalt);
+  const key = await deriveKey(password, salt);
+
+  const CHUNK_SIZE = 4 * 1024 * 1024;
+  const GCM_TAG_SIZE = 16;
+  const chunkIVs = fileMeta.chunkIVs;
+  const parts = [];
+  let offset = 0;
+
+  for (let i = 0; i < chunkIVs.length; i++) {
+    const iv = base64ToBytes(chunkIVs[i]);
+    const encChunkSize = Math.min(CHUNK_SIZE, fileMeta.size - (i * CHUNK_SIZE)) + GCM_TAG_SIZE;
+    const encChunk = encBuffer.slice(offset, offset + encChunkSize);
+    offset += encChunkSize;
+
+    const decrypted = await decryptChunk(key, encChunk, iv);
+    parts.push(new Uint8Array(decrypted));
+  }
+
+  return new Blob(parts, { type: fileMeta.mimeType || 'application/octet-stream' });
+}
+

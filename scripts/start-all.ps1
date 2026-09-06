@@ -16,7 +16,7 @@
 
 param([switch]$StopAll)
 
-$Root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$Root = Split-Path -Parent $PSScriptRoot
 if (-not $Root) { $Root = "d:\Distributed File System Project" }
 
 if ($StopAll) {
@@ -33,40 +33,32 @@ $storageNodePath = Join-Path $Root "services\storage-node"
 for ($i = 1; $i -le 3; $i++) {
     $port = 5000 + $i
     $nodeId = "node-$i"
-    $job = Start-Job -ScriptBlock {
-        param($path, $port, $nodeId)
-        Set-Location $path
-        $env:PORT = $port
-        $env:NODE_ID = $nodeId
-        node src/app.js
-    } -ArgumentList $storageNodePath, $port, $nodeId
+    $cmd = "Set-Location '$storageNodePath'; `$env:PORT=$port; `$env:NODE_ID='$nodeId'; node src/app.js"
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", $cmd
     Write-Host "   [Storage Node] ($nodeId) -> port $port" -ForegroundColor Green
 }
 
 # -- Metadata Service ------------------------------------------
 $metaPath = Join-Path $Root "services\metadata-service"
-Start-Job -ScriptBlock {
-    param($path)
-    Set-Location $path
-    node src/app.js
-} -ArgumentList $metaPath | Out-Null
+$cmd = "Set-Location '$metaPath'; node src/app.js"
+Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", $cmd
 Write-Host "   [Metadata Service] -> port 4000" -ForegroundColor Green
 
-# -- API Servers (2 instances for load balancing) ---------------
+# -- API Server ------------------------------------------------
 $apiPath = Join-Path $Root "services\api-server"
-foreach ($port in @(3000, 3001)) {
-    Start-Job -ScriptBlock {
-        param($path, $port)
-        Set-Location $path
-        $env:PORT = $port
-        node src/app.js
-    } -ArgumentList $apiPath, $port | Out-Null
-    Write-Host "   [API Server] -> port $port" -ForegroundColor Green
-}
+$cmd = "Set-Location '$apiPath'; `$env:PORT=3000; node src/app.js"
+Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", $cmd
+Write-Host "   [API Server] -> port 3000" -ForegroundColor Green
 
-Write-Host "`n[SUCCESS] All services starting. Ports:" -ForegroundColor Cyan
-Write-Host "   API:       3000, 3001"
+# -- Frontend --------------------------------------------------
+$frontendPath = Join-Path $Root "services\frontend"
+$cmd = "Set-Location '$frontendPath'; npm run dev"
+Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", $cmd
+Write-Host "   [Frontend] -> port 5173" -ForegroundColor Green
+
+Write-Host "`n[SUCCESS] All services started. Ports:" -ForegroundColor Cyan
+Write-Host "   API:       3000"
 Write-Host "   Metadata:  4000"
 Write-Host "   Storage:   5001, 5002, 5003"
-Write-Host "   Frontend:  Run 'npm run dev' in services/frontend/"
-Write-Host "   Nginx:     Run 'nginx -c nginx/nginx.conf' (optional)`n"
+Write-Host "   Frontend:  http://localhost:5173"
+Write-Host "   Admin UI:  http://localhost:5173/admin`n"

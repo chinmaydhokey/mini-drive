@@ -10,6 +10,7 @@ import {
   HiOutlineArrowDownTray, HiOutlinePencil, HiOutlineShare,
   HiOutlineTrash, HiOutlineClock, HiOutlineLink, HiOutlineCheckCircle,
   HiOutlineLockClosed, HiOutlineGlobeAlt, HiOutlineUserPlus, HiOutlineXMark,
+  HiOutlineExclamationTriangle,
 } from 'react-icons/hi2';
 import { filesAPI, foldersAPI, sharesAPI, bulkAPI } from '../services/api';
 import UploadManager from '../components/UploadManager';
@@ -77,11 +78,54 @@ export default function Dashboard() {
     }
   }, [folderId]);
 
+  // Failed file recovery state (replication exhausted)
+  const [failedFiles, setFailedFiles] = useState([]);
+
+  const loadFailedFiles = useCallback(async () => {
+    try {
+      const { data } = await filesAPI.listFailed();
+      setFailedFiles(data.data?.files || []);
+    } catch {
+      // Non-critical: fail silently
+    }
+  }, []);
+
+  const handleDeleteFailed = async (fileId) => {
+    try {
+      await filesAPI.deleteFailed(fileId);
+      toast.success('Failed file deleted. You can re-upload now.');
+      loadFailedFiles();
+      loadFolder();
+    } catch (err) {
+      toast.error(err.response?.data?.error?.message || 'Failed to delete file.');
+    }
+  };
+
+  const handleDownloadFailed = async (file) => {
+    try {
+      toast.loading(`Downloading ${file.originalName || file.filename}...`, { id: `failed-dl-${file._id}` });
+      const resp = await filesAPI.downloadLocal(file._id);
+      const url = window.URL.createObjectURL(new Blob([resp.data]));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.originalName || file.filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      a.remove();
+      toast.success('Downloaded! Local file will auto-expire in 24 hours.', { id: `failed-dl-${file._id}` });
+      loadFailedFiles();
+    } catch (err) {
+      toast.error(err.response?.data?.error?.message || 'Failed to download local copy.', { id: `failed-dl-${file._id}` });
+    }
+  };
+
   useEffect(() => {
     setSelectedItems(new Set());
     setLastSelected(null);
     loadFolder();
-  }, [loadFolder]);
+    loadFailedFiles();
+  }, [loadFolder, loadFailedFiles]);
 
   // Close context menu on click outside
   useEffect(() => {
@@ -134,8 +178,11 @@ export default function Dashboard() {
       }
     }
     setUploadProgress(null);
-    if (smallFiles.length > 0) loadFolder();
-  }, [folderId, loadFolder]);
+    if (smallFiles.length > 0) {
+      loadFolder();
+      loadFailedFiles();
+    }
+  }, [folderId, loadFolder, loadFailedFiles]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop, noClick: true, noKeyboard: true,
@@ -237,13 +284,17 @@ export default function Dashboard() {
         .filter(key => key.startsWith('file:'))
         .map(key => key.split(':')[1]);
 
+      // Collect direct file objects from folderData
+      const selectedFileObjects = (folderData?.files || [])
+        .filter(f => selectedFileIds.includes(String(f._id)));
+
       // For selected folders, gather all files inside them recursively
       const selectedFolderIds = Array.from(selectedItems)
         .filter(key => key.startsWith('folder:'))
         .map(key => key.split(':')[1]);
 
       // Fetch files from selected folders recursively
-      const folderFileIds = [];
+      const folderFileObjects = [];
       const visitedFolders = new Set();
       const queue = [...selectedFolderIds];
 
@@ -254,7 +305,7 @@ export default function Dashboard() {
         try {
           const { data } = await foldersAPI.getContents(fid);
           const folderFiles = data.data?.files || [];
-          folderFileIds.push(...folderFiles.map(f => f._id));
+          folderFileObjects.push(...folderFiles);
           const subfolders = data.data?.subfolders || [];
           for (const sub of subfolders) {
             if (!visitedFolders.has(sub._id)) {
@@ -266,13 +317,86 @@ export default function Dashboard() {
         }
       }
 
-      const allFileIds = [...new Set([...selectedFileIds, ...folderFileIds])];
+      // Merge and deduplicate file objects
+      const fileMap = new Map();
+      for (const f of [...selectedFileObjects, ...folderFileObjects]) {
+        fileMap.set(String(f._id), f);
+      }
+
+      // If any selected file ID was not in folderData (e.g. from search), fetch its metadata
+      for (const id of selectedFileIds) {
+        if (!fileMap.has(String(id))) {
+          try {
+            const { data } = await filesAPI.get(id);
+            if (data.data?.file) fileMap.set(String(id), data.data.file);
+          } catch {}
+        }
+      }
+
+      const allFiles = Array.from(fileMap.values());
+      const allFileIds = allFiles.map(f => f._id);
 
       if (allFileIds.length === 0) {
         toast.error('No files found for download.');
         return;
       }
 
+      const hasEncrypted = allFiles.some(f => Boolean(f.isEncrypted));
+
+      if (hasEncrypted) {
+        const vaultPassword = prompt('🔐 One or more selected files are encrypted in the Vault.\nEnter your vault password to decrypt them:');
+        if (!vaultPassword) {
+          toast('Download cancelled (vault password required for encrypted files).');
+          return;
+        }
+
+        toast.loading('Decrypting and preparing ZIP archive...', { id: 'bulk-zip' });
+        const { decryptFileBuffer } = await import('../services/cryptoEngine');
+        const { createZip } = await import('../utils/zipBuilder');
+
+        const zipEntries = [];
+        const usedNames = {};
+
+        for (const file of allFiles) {
+          let rawName = (file.originalName || file.filename || 'download').replace(/\s+\./g, '.').trim();
+          let name = rawName;
+          if (usedNames[rawName]) {
+            const ext = rawName.lastIndexOf('.') !== -1 ? rawName.slice(rawName.lastIndexOf('.')) : '';
+            const base = rawName.lastIndexOf('.') !== -1 ? rawName.slice(0, rawName.lastIndexOf('.')) : rawName;
+            name = `${base} (${usedNames[rawName]})${ext}`;
+          }
+          usedNames[rawName] = (usedNames[rawName] || 0) + 1;
+
+          if (file.isEncrypted) {
+            const { data: encBlob } = await filesAPI.download(file._id);
+            const encBuffer = await encBlob.arrayBuffer();
+            const decBlob = await decryptFileBuffer(encBuffer, file, vaultPassword);
+            const decBuffer = await decBlob.arrayBuffer();
+            zipEntries.push({ name, data: new Uint8Array(decBuffer) });
+          } else {
+            const { data: fileBlob } = await filesAPI.download(file._id);
+            const buffer = await fileBlob.arrayBuffer();
+            zipEntries.push({ name, data: new Uint8Array(buffer) });
+          }
+        }
+
+        const zipBlob = createZip(zipEntries);
+        const url = URL.createObjectURL(zipBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `MiniDrive_${allFiles.length}_files.zip`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          a.remove();
+        }, 60000);
+        setSelectedItems(new Set());
+        toast.success(`Decrypted and downloaded ${allFiles.length} file(s)!`, { id: 'bulk-zip' });
+        return;
+      }
+
+      // Unencrypted fast backend streaming ZIP
       const response = await bulkAPI.downloadZip(allFileIds);
 
       // Check if the response is a JSON error disguised as blob
@@ -287,8 +411,12 @@ export default function Dashboard() {
       const a = document.createElement('a');
       a.href = url;
       a.download = `MiniDrive_${allFileIds.length}_files.zip`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 60000);
       setSelectedItems(new Set());
     } catch (err) {
       // Handle blob error responses from axios
@@ -301,7 +429,7 @@ export default function Dashboard() {
           toast.error('Bulk download failed.');
         }
       } else {
-        toast.error(err.response?.data?.error?.message || 'Bulk download failed.');
+        toast.error(err.message || err.response?.data?.error?.message || 'Bulk download failed.');
       }
     }
   };
@@ -390,9 +518,16 @@ export default function Dashboard() {
 
         const decryptedBlob = new Blob(parts, { type: file.mimeType });
         const url = URL.createObjectURL(decryptedBlob);
+        const cleanName = (file.filename || file.originalName || 'download').replace(/\s+\./g, '.').trim();
         const a = document.createElement('a');
-        a.href = url; a.download = file.filename || file.originalName; a.click();
-        URL.revokeObjectURL(url);
+        a.href = url;
+        a.download = cleanName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          a.remove();
+        }, 60000);
         toast.success('File decrypted and downloaded!');
         return;
       }
@@ -400,9 +535,16 @@ export default function Dashboard() {
       // Normal (unencrypted) download
       const { data } = await filesAPI.download(file._id);
       const url = URL.createObjectURL(data);
+      const cleanName = (file.filename || file.originalName || 'download').replace(/\s+\./g, '.').trim();
       const a = document.createElement('a');
-      a.href = url; a.download = file.filename || file.originalName; a.click();
-      URL.revokeObjectURL(url);
+      a.href = url;
+      a.download = cleanName;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 60000);
     } catch { toast.error('Download failed.'); }
   };
 
@@ -584,6 +726,85 @@ export default function Dashboard() {
           </label>
         </div>
       </div>
+
+      {/* Failed Replication Alert Banner */}
+      {failedFiles.length > 0 && (
+        <div style={{
+          marginBottom: 24,
+          padding: '16px 20px',
+          background: 'rgba(239, 68, 68, 0.08)',
+          border: '1px solid rgba(239, 68, 68, 0.3)',
+          borderRadius: 'var(--radius-lg)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+            <HiOutlineExclamationTriangle style={{ color: '#ef4444', fontSize: '1.4rem', flexShrink: 0 }} />
+            <div style={{ flex: 1 }}>
+              <strong style={{ color: '#ef4444' }}>
+                Upload Replication Failed ({failedFiles.length} file{failedFiles.length > 1 ? 's' : ''})
+              </strong>
+              <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-muted)', marginTop: 2 }}>
+                These files could not be replicated to distributed storage nodes after multiple retry attempts.
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {failedFiles.map((file) => (
+              <div
+                key={file._id}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '10px 14px',
+                  background: 'var(--bg-secondary)',
+                  borderRadius: 'var(--radius-md)',
+                  border: '1px solid var(--surface-border)',
+                  gap: 12,
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontWeight: 500, fontSize: 'var(--fs-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {file.originalName || file.filename}
+                  </div>
+                  <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-muted)', display: 'flex', gap: 12, marginTop: 2 }}>
+                    <span>{formatSize(file.size)}</span>
+                    {file.alreadyDownloaded && (
+                      <span style={{ color: '#eab308' }}>Downloaded • Local copy auto-expires in 24h</span>
+                    )}
+                    {file.error && (
+                      <span style={{ color: '#ef4444' }} title={file.error}>
+                        Error: {file.error.length > 40 ? file.error.slice(0, 40) + '...' : file.error}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                  {file.localAvailable && (
+                    <button
+                      className="btn btn-secondary"
+                      style={{ fontSize: 'var(--fs-xs)', padding: '6px 12px' }}
+                      onClick={() => handleDownloadFailed(file)}
+                      title="Download the local temporary copy before it expires in 24 hours"
+                    >
+                      <HiOutlineArrowDownTray size={14} /> Download Local Copy
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-danger"
+                    style={{ fontSize: 'var(--fs-xs)', padding: '6px 12px' }}
+                    onClick={() => handleDeleteFailed(file._id)}
+                    title="Delete record and retry upload from your machine"
+                  >
+                    <HiOutlineTrash size={14} /> Delete & Retry
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Folders */}
       {subfolders.length > 0 && (
@@ -1070,9 +1291,16 @@ function VersionModal({ file, onClose, onRefresh }) {
     try {
       const { data } = await filesAPI.downloadVersion(file._id, vNum);
       const url = URL.createObjectURL(data);
+      const cleanName = (file.filename || 'version-download').replace(/\s+\./g, '.').trim();
       const a = document.createElement('a');
-      a.href = url; a.download = file.filename; a.click();
-      URL.revokeObjectURL(url);
+      a.href = url;
+      a.download = cleanName;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 60000);
     } catch { toast.error('Download failed.'); }
   };
 

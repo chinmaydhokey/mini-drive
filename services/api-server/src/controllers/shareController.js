@@ -6,6 +6,16 @@ const User = require('../models/User');
 const AppError = require('../utils/AppError');
 const fs = require('fs');
 
+function buildContentDisposition(dispositionType, filename) {
+  const cleanName = (filename || 'download')
+    .replace(/["\r\n\\]/g, '_')
+    .replace(/\s+\./g, '.')
+    .trim();
+  const asciiFallback = cleanName.replace(/[^\x20-\x7E]/g, '_');
+  const encodedName = encodeURIComponent(cleanName);
+  return `${dispositionType}; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`;
+}
+
 /**
  * POST /api/shares
  * Create a public share link for a file or folder.
@@ -309,8 +319,8 @@ const listSharedWithMe = async (req, res, next) => {
       shareType: 'PRIVATE',
       isRevoked: false,
     })
-      .populate('fileId', 'filename originalName mimeType size createdAt')
-      .populate('fileIds', 'filename originalName mimeType size createdAt')
+      .populate('fileId', 'filename originalName mimeType size createdAt isEncrypted encryptionSalt chunkIVs totalChunks')
+      .populate('fileIds', 'filename originalName mimeType size createdAt isEncrypted encryptionSalt chunkIVs totalChunks')
       .populate('folderId', 'name path depth createdAt')
       .populate('folderIds', 'name path depth createdAt')
       .populate('createdBy', 'email name')
@@ -510,7 +520,7 @@ const accessShare = async (req, res, next) => {
         _id: { $in: share.fileIds || [] },
         isDeleted: false,
         status: 'AVAILABLE',
-      }).select('filename originalName mimeType size createdAt');
+      }).select('filename originalName mimeType size createdAt isEncrypted encryptionSalt chunkIVs totalChunks');
 
       let folderFiles = [];
       let subfolders = [];
@@ -533,7 +543,7 @@ const accessShare = async (req, res, next) => {
             folderId: { $in: allFolderIds },
             isDeleted: false,
             status: 'AVAILABLE',
-          }).select('filename originalName mimeType size createdAt folderId');
+          }).select('filename originalName mimeType size createdAt folderId isEncrypted encryptionSalt chunkIVs totalChunks');
           folderFiles.push(...fFiles);
         }
       }
@@ -573,7 +583,7 @@ const accessShare = async (req, res, next) => {
         folderId: { $in: allFolderIds },
         isDeleted: false,
         status: 'AVAILABLE',
-      }).select('filename originalName mimeType size createdAt folderId');
+      }).select('filename originalName mimeType size createdAt folderId isEncrypted encryptionSalt chunkIVs totalChunks');
 
       const totalSize = files.reduce((acc, f) => acc + (f.size || 0), 0);
 
@@ -607,6 +617,10 @@ const accessShare = async (req, res, next) => {
           mimeType: file.mimeType,
           size: file.size,
           createdAt: file.createdAt,
+          isEncrypted: file.isEncrypted,
+          encryptionSalt: file.encryptionSalt,
+          chunkIVs: file.chunkIVs,
+          totalChunks: file.totalChunks,
         },
         permission: share.permission,
         expiresAt: share.expiresAt,
@@ -734,26 +748,44 @@ const downloadShare = async (req, res, next) => {
       const chunkService = require('../services/chunkService');
       const usedNames = {};
       for (const file of allFiles) {
-        let name = file.originalName || file.filename;
-        if (usedNames[name]) {
-          const ext = name.lastIndexOf('.') !== -1 ? name.slice(name.lastIndexOf('.')) : '';
-          const base = name.lastIndexOf('.') !== -1 ? name.slice(0, name.lastIndexOf('.')) : name;
-          name = `${base} (${usedNames[name]})${ext}`;
+        let rawName = (file.originalName || file.filename || 'file').replace(/\s+\./g, '.').trim();
+        let name = rawName;
+        if (usedNames[rawName]) {
+          const ext = rawName.lastIndexOf('.') !== -1 ? rawName.slice(rawName.lastIndexOf('.')) : '';
+          const base = rawName.lastIndexOf('.') !== -1 ? rawName.slice(0, rawName.lastIndexOf('.')) : rawName;
+          name = `${base} (${usedNames[rawName]})${ext}`;
         }
-        usedNames[file.originalName || file.filename] = (usedNames[file.originalName || file.filename] || 0) + 1;
+        usedNames[rawName] = (usedNames[rawName] || 0) + 1;
 
         if (file.totalChunks > 0) {
-          try {
-            await require('fs').promises.access(file.storagePath);
-            archive.file(file.storagePath, { name });
-          } catch {
+          let streamedFromDisk = false;
+          if (file.storagePath && !file.storagePath.startsWith('chunked://')) {
+            try {
+              await require('fs').promises.access(file.storagePath);
+              archive.file(file.storagePath, { name });
+              streamedFromDisk = true;
+            } catch {}
+          }
+          if (!streamedFromDisk) {
+            const { PassThrough } = require('stream');
+            const passThrough = new PassThrough();
+            archive.append(passThrough, { name });
             for (let i = 0; i < file.totalChunks; i++) {
-              const stream = await chunkService.getChunkStream(file._id, i);
-              archive.append(stream, { name: `${name}.part${i}` });
+              const chunkStream = await chunkService.getChunkStream(file._id, i);
+              await new Promise((resolve, reject) => {
+                chunkStream.pipe(passThrough, { end: i === file.totalChunks - 1 });
+                chunkStream.on('end', resolve);
+                chunkStream.on('error', (err) => {
+                  passThrough.destroy(err);
+                  reject(err);
+                });
+              });
             }
           }
-        } else {
+        } else if (file.storagePath && !file.storagePath.startsWith('chunked://')) {
           archive.file(file.storagePath, { name });
+        } else {
+          archive.append(Buffer.alloc(0), { name });
         }
       }
 
@@ -777,10 +809,14 @@ const downloadShare = async (req, res, next) => {
     // Increment download count atomically
     await ShareLink.updateOne({ _id: share._id }, { $inc: { downloadCount: 1 } });
 
+    const streamLength = file.isEncrypted && file.totalChunks > 0
+      ? file.size + (file.totalChunks * 16)
+      : file.size;
     res.set({
-      'Content-Type': file.mimeType,
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(file.originalName || file.filename)}"`,
-      'Content-Length': file.size,
+      'Content-Type': file.mimeType || 'application/octet-stream',
+      'Content-Disposition': buildContentDisposition('attachment', file.originalName || file.filename),
+      'Content-Length': streamLength,
+      'Accept-Ranges': 'bytes',
     });
 
     if (file.totalChunks > 0) {
@@ -850,10 +886,18 @@ const viewShare = async (req, res, next) => {
       }
     }
 
+    const streamLength = file.isEncrypted && file.totalChunks > 0
+      ? file.size + (file.totalChunks * 16)
+      : file.size;
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
     res.set({
-      'Content-Type': file.mimeType,
-      'Content-Disposition': `inline; filename="${encodeURIComponent(file.originalName || file.filename)}"`,
-      'Content-Length': file.size,
+      'Content-Type': file.mimeType || 'application/octet-stream',
+      'Content-Disposition': buildContentDisposition('inline', file.originalName || file.filename),
+      'Content-Length': streamLength,
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Cross-Origin-Embedder-Policy': 'unsafe-none',
+      'Accept-Ranges': 'bytes',
     });
 
     if (file.totalChunks > 0) {
@@ -919,10 +963,14 @@ const downloadBatchFile = async (req, res, next) => {
 
     await ShareLink.updateOne({ _id: share._id }, { $inc: { downloadCount: 1 } });
 
+    const streamLength = file.isEncrypted && file.totalChunks > 0
+      ? file.size + (file.totalChunks * 16)
+      : file.size;
     res.set({
-      'Content-Type': file.mimeType,
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(file.originalName || file.filename)}"`,
-      'Content-Length': file.size,
+      'Content-Type': file.mimeType || 'application/octet-stream',
+      'Content-Disposition': buildContentDisposition('attachment', file.originalName || file.filename),
+      'Content-Length': streamLength,
+      'Accept-Ranges': 'bytes',
     });
 
     if (file.totalChunks > 0) {
@@ -983,10 +1031,18 @@ const viewBatchFile = async (req, res, next) => {
       }
     }
 
+    const streamLength = file.isEncrypted && file.totalChunks > 0
+      ? file.size + (file.totalChunks * 16)
+      : file.size;
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
     res.set({
-      'Content-Type': file.mimeType,
-      'Content-Disposition': `inline; filename="${encodeURIComponent(file.originalName || file.filename)}"`,
-      'Content-Length': file.size,
+      'Content-Type': file.mimeType || 'application/octet-stream',
+      'Content-Disposition': buildContentDisposition('inline', file.originalName || file.filename),
+      'Content-Length': streamLength,
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Cross-Origin-Embedder-Policy': 'unsafe-none',
+      'Accept-Ranges': 'bytes',
     });
 
     if (file.totalChunks > 0) {

@@ -45,7 +45,7 @@ const fileSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['UPLOADING', 'AVAILABLE', 'FAILED', 'DELETED'],
+      enum: ['UPLOADING', 'AVAILABLE', 'PENDING_REPLICATION', 'FAILED', 'DELETED'],
       default: 'UPLOADING',
     },
     isDeleted: {
@@ -77,6 +77,12 @@ const fileSchema = new mongoose.Schema(
     compressionAlgo: { type: String, default: null },  // Phase 15: compression
     virusScanStatus: { type: String, default: null },  // Phase 20: virus scan
     tags: { type: [String], default: [] },             // future: tagging
+
+    // --- Replication tracking (reconciliation worker) ---
+    replicationAttempts: { type: Number, default: 0 },
+    lastReplicationError: { type: String, default: null },
+    nextReplicationRetry: { type: Date, default: null },
+    failedFileDownloadedAt: { type: Date, default: null },  // tracks when user downloaded a FAILED file's local copy
   },
   {
     timestamps: true,
@@ -89,6 +95,10 @@ fileSchema.index({ userId: 1, isDeleted: 1 });             // recycle bin querie
 fileSchema.index({ userId: 1, status: 1 });                // filter by status
 fileSchema.index({ filename: 'text', tags: 'text' });      // full-text search
 fileSchema.index({ sha256Hash: 1 });                       // future: dedup lookup
+fileSchema.index(
+  { status: 1, nextReplicationRetry: 1, replicationAttempts: 1 },
+  { partialFilterExpression: { status: 'PENDING_REPLICATION' } }
+);
 fileSchema.index({ deletedAt: 1 }, {
   expireAfterSeconds: 30 * 24 * 60 * 60, // auto-purge after 30 days (TTL index)
   partialFilterExpression: { isDeleted: true },
@@ -100,6 +110,10 @@ fileSchema.methods.toSafeObject = function () {
   delete obj.storagePath;  // don't expose internal storage path to client
   delete obj.storageKey;
   delete obj.__v;
+  delete obj.lastReplicationError;
+  delete obj.nextReplicationRetry;
+  delete obj.replicationAttempts;
+  delete obj.failedFileDownloadedAt;
   return obj;
 };
 

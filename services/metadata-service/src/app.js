@@ -65,6 +65,10 @@ app.use((err, req, res, next) => {
 
 // ── Start ────────────────────────────────────────────────────
 const start = async () => {
+  if (config.mongoUri && config.mongoUri.startsWith('mongodb+srv://')) {
+    const dns = require('dns');
+    try { dns.setServers(['8.8.8.8', '1.1.1.1']); } catch (_) {}
+  }
   await mongoose.connect(config.mongoUri);
   console.log(`✅ MongoDB connected: ${mongoose.connection.host}`);
 

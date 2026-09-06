@@ -4,10 +4,11 @@ const router = express.Router();
 const shareController = require('../controllers/shareController');
 const { authenticate } = require('../middleware/auth');
 
-// Optional auth middleware — attaches req.user if token present, but doesn't 403
+// Optional auth middleware — attaches req.user if token present (header or query), but doesn't 403
 const optionalAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return next();
+  const hasHeader = req.headers.authorization && req.headers.authorization.startsWith('Bearer ');
+  const hasQuery = req.query && req.query.token;
+  if (!hasHeader && !hasQuery) return next();
   // Reuse the authenticate middleware but catch errors to make it optional
   authenticate(req, res, (err) => {
     // If auth fails, just continue without req.user

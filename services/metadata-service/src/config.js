@@ -15,7 +15,7 @@ for (const p of envPaths) {
 
 module.exports = {
   port: parseInt(process.env.METADATA_PORT || '4000', 10),
-  mongoUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/minidrive',
+  mongoUri: process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://localhost:27017/minidrive',
   replicationFactor: parseInt(process.env.REPLICATION_FACTOR || '3', 10),
   chunkSize: parseInt(process.env.CHUNK_SIZE || String(4 * 1024 * 1024), 10), // 4 MB
   storageNodes: JSON.parse(

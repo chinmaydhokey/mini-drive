@@ -114,8 +114,9 @@ export const filesAPI = {
   download: (id) => api.get(`/files/${id}/download`, { responseType: 'blob' }),
   viewBlob: (id) => api.get(`/files/${id}/view`, { responseType: 'blob' }),
   viewUrl: (id) => {
-    const base = `/api/files/${id}/view`;
-    return accessToken ? `${base}?token=${encodeURIComponent(accessToken)}` : base;
+    const base = `${API_BASE.replace(/\/+$/, '')}/files/${id}/view`;
+    const token = accessToken || localStorage.getItem('minidrive_access_token');
+    return token ? `${base}?token=${encodeURIComponent(token)}` : base;
   },
   getText: (id) => api.get(`/files/${id}/view`, { responseType: 'text' }),
   update: (id, data) => api.patch(`/files/${id}`, data),
@@ -143,6 +144,10 @@ export const filesAPI = {
     }),
   uploadComplete: (data) => api.post('/files/upload/complete', data),
   uploadStatus: (fileId) => api.get(`/files/upload/status/${fileId}`),
+  // Failed file recovery
+  listFailed: () => api.get('/files/failed'),
+  downloadLocal: (id) => api.get(`/files/${id}/download-local`, { responseType: 'blob' }),
+  deleteFailed: (id) => api.delete(`/files/${id}/failed`),
 };
 
 // ── Folders API ──────────────────────────────────────────────
@@ -168,16 +173,26 @@ export const sharesAPI = {
     params: password ? { password } : {},
   }),
   viewUrl: (token, password) => {
-    const base = `/api/shares/${token}/view`;
-    return password ? `${base}?password=${encodeURIComponent(password)}` : base;
+    const base = `${API_BASE.replace(/\/+$/, '')}/shares/${token}/view`;
+    const params = new URLSearchParams();
+    if (password) params.set('password', password);
+    const jwt = accessToken || localStorage.getItem('minidrive_access_token');
+    if (jwt) params.set('token', jwt);
+    const qs = params.toString();
+    return qs ? `${base}?${qs}` : base;
   },
   downloadBatchFile: (token, fileId, password) => api.get(`/shares/${token}/files/${fileId}/download`, {
     responseType: 'blob',
     params: password ? { password } : {},
   }),
   viewBatchFileUrl: (token, fileId, password) => {
-    const base = `/api/shares/${token}/files/${fileId}/view`;
-    return password ? `${base}?password=${encodeURIComponent(password)}` : base;
+    const base = `${API_BASE.replace(/\/+$/, '')}/shares/${token}/files/${fileId}/view`;
+    const params = new URLSearchParams();
+    if (password) params.set('password', password);
+    const jwt = accessToken || localStorage.getItem('minidrive_access_token');
+    if (jwt) params.set('token', jwt);
+    const qs = params.toString();
+    return qs ? `${base}?${qs}` : base;
   },
   revoke: (shareId) => api.delete(`/shares/${shareId}`),
   updatePermissions: (shareId, data) => api.patch(`/shares/${shareId}/permissions`, data),

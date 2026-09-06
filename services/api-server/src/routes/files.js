@@ -32,6 +32,9 @@ router.get('/storage', fileController.getStorageStats);
 // ── Search (must be before /:id to avoid matching "search" as an ID) ──
 router.get('/search', fileController.searchFiles);
 
+// ── Failed file recovery (must be before /:id) ──────────────
+router.get('/failed', fileController.listFailedFiles);
+
 // ── List all files ───────────────────────────────────────────
 router.get('/', fileController.listFiles);
 
@@ -41,6 +44,8 @@ router.get('/:id/download', fileController.downloadFile);
 router.get('/:id/view', fileController.viewFile);
 router.patch('/:id', fileController.updateFile);
 router.delete('/:id', fileController.deleteFile);
+router.get('/:id/download-local', fileController.downloadFailedFile);
+router.delete('/:id/failed', fileController.deleteFailedFile);
 
 // ── Version operations ───────────────────────────────────────
 router.get('/:id/versions', versionController.listVersions);

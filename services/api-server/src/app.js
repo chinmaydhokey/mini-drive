@@ -9,6 +9,7 @@ const connectDB = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
 const { initRedis, getStatus: redisStatus } = require('./services/cacheService');
 const { apiRateLimit, authRateLimit, uploadRateLimit } = require('./middleware/rateLimiter');
+const reconciliationWorker = require('./services/reconciliationWorker');
 
 // Route imports
 const authRoutes = require('./routes/auth');
@@ -23,9 +24,25 @@ const bulkRoutes = require('./routes/bulk');
 const app = express();
 
 // ── Global Middleware ────────────────────────────────────────
-app.use(helmet());                           // Security headers
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false,
+  frameguard: false, // Allow embedding in preview iframes on frontend origin
+}));
 app.use(cors({
-  origin: config.cors.origin,
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (
+      origin === config.cors.origin ||
+      origin === 'http://localhost:5173' ||
+      origin === 'http://localhost:3000' ||
+      origin.endsWith('.onrender.com')
+    ) {
+      return callback(null, true);
+    }
+    return callback(null, origin);
+  },
   credentials: true,                        // Allow cookies
 }));
 app.use(morgan('dev'));                      // Request logging
@@ -44,6 +61,7 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     redis: redisStatus(),
+    reconciliation: reconciliationWorker.getStats(),
   });
 });
 
@@ -71,12 +89,27 @@ app.use(errorHandler);
 const startServer = async () => {
   await connectDB();
   initRedis(); // Non-blocking — app works without Redis
+  reconciliationWorker.start(); // Start background replication retries
 
-  app.listen(config.port, () => {
+  const server = app.listen(config.port, () => {
     console.log(`\n🚀 API Server running in ${config.env} mode on port ${config.port}`);
     console.log(`   Health check: http://localhost:${config.port}/health`);
     console.log(`   Auth API:     http://localhost:${config.port}/api/auth\n`);
   });
+
+  // Graceful shutdown
+  const shutdown = (signal) => {
+    console.log(`\n${signal} received. Shutting down gracefully...`);
+    reconciliationWorker.stop();
+    server.close(() => {
+      console.log('👋 Server closed.');
+      process.exit(0);
+    });
+    // Force exit after 10 seconds if connections don't close
+    setTimeout(() => process.exit(1), 10000);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 };
 
 startServer().catch((err) => {

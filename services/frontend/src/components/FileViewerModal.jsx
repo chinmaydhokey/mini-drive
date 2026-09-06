@@ -1,11 +1,12 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
-  HiOutlineXMark, HiOutlineEye, HiOutlineArrowDownTray,
+  HiOutlineXMark, HiOutlineArrowDownTray,
   HiOutlineMagnifyingGlassPlus, HiOutlineMagnifyingGlassMinus,
   HiOutlineArrowPath, HiOutlineLockClosed, HiOutlineDocumentText,
-  HiOutlineDocument, HiOutlineCodeBracket,
+  HiOutlineDocument, HiOutlineKey,
 } from 'react-icons/hi2';
 import api from '../services/api';
+import { decryptFileBuffer } from '../services/cryptoEngine';
 
 function formatSize(bytes) {
   if (!bytes || bytes <= 0 || !isFinite(bytes)) return '0 B';
@@ -27,23 +28,47 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
   const [rotation, setRotation] = useState(0);
   const [textContent, setTextContent] = useState(null);
   const [blobUrl, setBlobUrl] = useState(null);
+  const [loadedBlob, setLoadedBlob] = useState(null);
+  const [decryptedBlob, setDecryptedBlob] = useState(null);
   const [loadingContent, setLoadingContent] = useState(true);
   const [error, setError] = useState(null);
 
-  const name = file?.originalName || file?.filename || 'File Preview';
+  // Vault state
+  const isEncrypted = Boolean(file?.isEncrypted);
+  const [vaultPassword, setVaultPassword] = useState('');
+  const [decrypting, setDecrypting] = useState(false);
+  const [vaultError, setVaultError] = useState(null);
+  const [isUnlocked, setIsUnlocked] = useState(!isEncrypted);
+
+  const activeBlobUrlRef = useRef(null);
+
+  const name = (file?.originalName || file?.filename || 'File Preview').replace(/\s+\./g, '.').trim();
   const mimeType = file?.mimeType || '';
   const isViewOnly = permission === 'VIEW';
 
-  // Load content with authenticated axios instance
-  useEffect(() => {
-    if (!viewUrl) return;
-    let active = true;
-    let createdUrl = null;
-    setLoadingContent(true);
-    setError(null);
+  const cleanRequestUrl = (url) => {
+    if (!url) return '';
+    try {
+      if (url.startsWith('http://') || url.startsWith('https://')) {
+        const u = new URL(url);
+        return u.pathname.replace(/^\/api/, '') + u.search;
+      }
+    } catch {}
+    return url.replace(/^\/api/, '');
+  };
 
-    // Strip leading /api if present because axios baseURL is already /api
-    const requestUrl = viewUrl.startsWith('/api/') ? viewUrl.substring(4) : viewUrl;
+  // Load normal (unencrypted) content
+  useEffect(() => {
+    if (!viewUrl || isEncrypted) {
+      if (isEncrypted) setLoadingContent(false);
+      return;
+    }
+
+    let active = true;
+    setError(null);
+    setLoadingContent(true);
+
+    const requestUrl = cleanRequestUrl(viewUrl);
 
     if (isTextOrCode(mimeType, name)) {
       api.get(requestUrl, { responseType: 'text' })
@@ -60,17 +85,21 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
           if (active) setLoadingContent(false);
         });
     } else {
+      // For PDFs, images, videos, and audio: fetch blob and construct a local blob URL
       api.get(requestUrl, { responseType: 'blob' })
         .then((res) => {
-          if (active) {
-            createdUrl = URL.createObjectURL(res.data);
-            setBlobUrl(createdUrl);
-          }
+          if (!active) return;
+          const blob = new Blob([res.data], { type: mimeType || 'application/octet-stream' });
+          const url = URL.createObjectURL(blob);
+          if (activeBlobUrlRef.current) URL.revokeObjectURL(activeBlobUrlRef.current);
+          activeBlobUrlRef.current = url;
+          setLoadedBlob(blob);
+          setBlobUrl(url);
         })
         .catch((err) => {
           if (active) {
-            const msg = err.response?.data?.error?.message || err.response?.data?.error || err.message || 'Failed to load preview.';
-            setError(typeof msg === 'string' ? msg : 'Failed to load preview.');
+            const msg = err.response?.data?.error?.message || err.response?.data?.error || err.message || 'Failed to load file preview.';
+            setError(typeof msg === 'string' ? msg : 'Failed to load file preview.');
           }
         })
         .finally(() => {
@@ -80,11 +109,48 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
 
     return () => {
       active = false;
-      if (createdUrl) URL.revokeObjectURL(createdUrl);
+      if (activeBlobUrlRef.current) {
+        URL.revokeObjectURL(activeBlobUrlRef.current);
+        activeBlobUrlRef.current = null;
+      }
     };
-  }, [viewUrl, mimeType, name]);
+  }, [viewUrl, isEncrypted, mimeType, name]);
 
-  // Handle keyboard shortcuts (Escape to close, block Ctrl+S / Ctrl+P for view-only)
+  // Handle Vault Unlock for encrypted file
+  const handleUnlockVault = async (e) => {
+    if (e) e.preventDefault();
+    if (!vaultPassword) return;
+
+    setDecrypting(true);
+    setVaultError(null);
+
+    try {
+      const requestUrl = cleanRequestUrl(viewUrl);
+      const res = await api.get(requestUrl, { responseType: 'arraybuffer' });
+      const encBuffer = res.data;
+
+      const decBlob = await decryptFileBuffer(encBuffer, file, vaultPassword);
+      const url = URL.createObjectURL(decBlob);
+      if (activeBlobUrlRef.current) URL.revokeObjectURL(activeBlobUrlRef.current);
+      activeBlobUrlRef.current = url;
+
+      setDecryptedBlob(decBlob);
+      setBlobUrl(url);
+      setIsUnlocked(true);
+
+      if (isTextOrCode(mimeType, name)) {
+        const text = await decBlob.text();
+        setTextContent(text);
+      }
+    } catch (err) {
+      console.error('Vault decryption error:', err);
+      setVaultError('Decryption failed. Please check your vault password.');
+    } finally {
+      setDecrypting(false);
+    }
+  };
+
+  // Keyboard shortcuts (Escape, Ctrl+S / Ctrl+P view-only blocker)
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
@@ -101,9 +167,67 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
   const handleZoomIn = () => setZoom((z) => Math.min(3, z + 0.25));
   const handleZoomOut = () => setZoom((z) => Math.max(0.5, z - 0.25));
   const handleRotate = () => setRotation((r) => (r + 90) % 360);
-  const handleReset = () => { setZoom(1); setRotation(0); };
+
+  const handleDownloadFile = () => {
+    const targetBlob = decryptedBlob || loadedBlob;
+    if (targetBlob) {
+      const url = URL.createObjectURL(targetBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 60000);
+      return;
+    }
+    if (onDownload) onDownload();
+  };
 
   const renderContent = () => {
+    // Encrypted Vault Locked State
+    if (isEncrypted && !isUnlocked) {
+      return (
+        <div className="viewer-vault-box">
+          <div className="viewer-vault-icon">
+            <HiOutlineLockClosed style={{ fontSize: 44, color: '#818cf8' }} />
+          </div>
+          <h3 style={{ color: '#f1f3f9', margin: '0 0 6px', fontSize: '1.25rem' }}>Encrypted Vault File</h3>
+          <p style={{ color: '#8b8ea8', fontSize: '0.875rem', maxWidth: 420, margin: '0 auto 20px', lineHeight: 1.5 }}>
+            This file was encrypted client-side with AES-256-GCM. Enter your vault password to decrypt and view it.
+          </p>
+
+          <form onSubmit={handleUnlockVault} style={{ width: '100%', maxWidth: 360, margin: '0 auto' }}>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <input
+                type="password"
+                className="form-input"
+                placeholder="Enter vault password"
+                value={vaultPassword}
+                onChange={(e) => setVaultPassword(e.target.value)}
+                autoFocus
+                style={{ flex: 1, padding: '10px 14px', borderRadius: 8, background: '#1a1c36', border: '1px solid #2a2e4d', color: '#fff' }}
+              />
+              <button
+                type="submit"
+                className="btn btn-primary"
+                disabled={decrypting || !vaultPassword}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '10px 16px', borderRadius: 8 }}
+              >
+                {decrypting ? <div className="spinner" style={{ width: 16, height: 16 }} /> : <HiOutlineKey />}
+                {decrypting ? 'Decrypting...' : 'Unlock'}
+              </button>
+            </div>
+            {vaultError && (
+              <p style={{ color: '#ff3d71', fontSize: '0.85rem', margin: '4px 0 0' }}>{vaultError}</p>
+            )}
+          </form>
+        </div>
+      );
+    }
+
     if (loadingContent) {
       return (
         <div className="viewer-loading">
@@ -189,15 +313,6 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
     }
 
     if (isTextOrCode(mimeType, name)) {
-      if (loadingText) {
-        return (
-          <div className="viewer-loading">
-            <div className="spinner" style={{ width: 32, height: 32 }} />
-            <p>Loading text preview...</p>
-          </div>
-        );
-      }
-
       if (textContent !== null) {
         const lines = textContent.split('\n');
         return (
@@ -214,14 +329,13 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
 
       return (
         <iframe
-          src={viewUrl}
+          src={mediaSrc}
           title={name}
           style={{ width: '100%', height: '75vh', border: '1px solid #2a2e4d', borderRadius: 8, background: '#121324', color: '#e8eaf0' }}
         />
       );
     }
 
-    // Generic unsupported file preview
     return (
       <div className="viewer-unsupported">
         <HiOutlineDocument style={{ fontSize: 64, color: '#6366f1', marginBottom: 16 }} />
@@ -245,6 +359,11 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
             <h2 className="viewer-filename" title={name}>{name}</h2>
             <div className="viewer-badges">
               <span className="badge badge-info">{formatSize(file?.size)}</span>
+              {isEncrypted && (
+                <span className="badge badge-primary" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'rgba(99, 102, 241, 0.2)', color: '#a5b4fc', border: '1px solid rgba(99, 102, 241, 0.4)' }}>
+                  🔐 Encrypted Vault
+                </span>
+              )}
               {isViewOnly ? (
                 <span className="badge badge-warning" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                   <HiOutlineLockClosed /> View Only
@@ -266,8 +385,8 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
               </div>
             )}
 
-            {!isViewOnly && onDownload && (
-              <button className="btn btn-sm btn-primary" onClick={onDownload} title="Download File">
+            {!isViewOnly && (onDownload || isUnlocked) && (
+              <button className="btn btn-sm btn-primary" onClick={handleDownloadFile} title="Download File">
                 <HiOutlineArrowDownTray /> Download
               </button>
             )}
@@ -370,6 +489,26 @@ export default function FileViewerModal({ file, permission = 'VIEW', viewUrl, on
           overflow: auto;
           min-height: 400px;
           background: #0d0e1d;
+        }
+        .viewer-vault-box {
+          text-align: center;
+          padding: 40px 20px;
+          background: rgba(22, 24, 48, 0.7);
+          border: 1px solid #2a2e4d;
+          border-radius: 16px;
+          max-width: 500px;
+          width: 100%;
+        }
+        .viewer-vault-icon {
+          width: 72px;
+          height: 72px;
+          border-radius: 20px;
+          background: rgba(99, 102, 241, 0.12);
+          border: 1px solid rgba(99, 102, 241, 0.3);
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          margin-bottom: 16px;
         }
         .viewer-image-canvas {
           display: flex;

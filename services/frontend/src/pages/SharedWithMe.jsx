@@ -43,8 +43,46 @@ function SharedWithMe() {
     }
   };
 
-  const handleDownload = async (fileId, name, shareToken) => {
+  const handleDownload = async (fileId, name, shareToken, fileObj) => {
     try {
+      const cleanName = (name || 'download').replace(/\s+\./g, '.').trim();
+
+      if (fileObj?.isEncrypted) {
+        const vaultPwd = prompt('Enter vault password to decrypt this file:');
+        if (!vaultPwd) return;
+        toast.loading('Decrypting and downloading...', { id: 'download' });
+
+        const { decryptFileBuffer } = await import('../services/cryptoEngine');
+        let encBlob;
+        try {
+          const { data } = await filesAPI.download(fileId);
+          encBlob = data;
+        } catch (err) {
+          if (shareToken) {
+            const { data } = await sharesAPI.download(shareToken);
+            encBlob = data;
+          } else {
+            throw err;
+          }
+        }
+        const encBuffer = await encBlob.arrayBuffer();
+        const decryptedBlob = await decryptFileBuffer(encBuffer, fileObj, vaultPwd);
+
+        const url = window.URL.createObjectURL(decryptedBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = cleanName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          window.URL.revokeObjectURL(url);
+          a.remove();
+        }, 60000);
+
+        toast.success('Download started', { id: 'download' });
+        return;
+      }
+
       toast.loading('Preparing download...', { id: 'download' });
       let blob;
       try {
@@ -62,16 +100,18 @@ function SharedWithMe() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = name;
+      a.download = cleanName;
       document.body.appendChild(a);
       a.click();
-      window.URL.revokeObjectURL(url);
-      a.remove();
+      setTimeout(() => {
+        window.URL.revokeObjectURL(url);
+        a.remove();
+      }, 60000);
 
       toast.success('Download started', { id: 'download' });
     } catch (err) {
       console.error('Download error:', err);
-      toast.error('Failed to download file', { id: 'download' });
+      toast.error(err.message || 'Failed to download file', { id: 'download' });
     }
   };
 
@@ -183,7 +223,7 @@ function SharedWithMe() {
                       {!isFolder && permissionLevel === 'DOWNLOAD' && (fileId || item.token) && (
                         <button
                           className="btn btn-sm btn-ghost"
-                          onClick={() => handleDownload(fileId, name, item.token)}
+                          onClick={() => handleDownload(fileId, name, item.token, item.file)}
                           title="Download"
                         >
                           <HiOutlineArrowDownTray />
@@ -206,7 +246,7 @@ function SharedWithMe() {
           viewUrl={viewerItem.viewUrl}
           onClose={() => setViewerItem(null)}
           onDownload={viewerItem.permission === 'DOWNLOAD'
-            ? () => handleDownload(viewerItem.file?._id, viewerItem.file?.originalName || viewerItem.file?.filename, viewerItem.shareToken)
+            ? () => handleDownload(viewerItem.file?._id, viewerItem.file?.originalName || viewerItem.file?.filename, viewerItem.shareToken, viewerItem.file)
             : undefined}
         />
       )}

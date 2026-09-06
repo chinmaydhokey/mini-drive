@@ -46,7 +46,7 @@ async function processAndUploadChunks(fileId, filePath) {
         contentType: 'application/octet-stream',
       });
 
-      console.log(`   Uploading chunk ${index + 1}/${totalChunks} (${chunkSize} bytes) to Metadata Service...`);
+      console.log(`Uploading chunk ${index + 1}/${totalChunks} (${chunkSize} bytes) to Metadata Service...`);
 
       try {
         const response = await axios.post(`${METADATA_URL}/api/chunks/upload`, form, {

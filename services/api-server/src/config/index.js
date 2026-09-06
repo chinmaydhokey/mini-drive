@@ -1,8 +1,21 @@
 const dotenv = require('dotenv');
 const path = require('path');
 
-// Load .env from project root (two levels up from services/api-server/src/)
-dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+const fs = require('fs');
+
+// Load .env from project root
+const envPaths = [
+  path.resolve(__dirname, '../../../../.env'),
+  path.resolve(__dirname, '../../../.env'),
+  path.resolve(__dirname, '../../.env'),
+  path.resolve(__dirname, '../.env'),
+];
+for (const p of envPaths) {
+  if (fs.existsSync(p)) {
+    dotenv.config({ path: p });
+    break;
+  }
+}
 
 const config = {
   env: process.env.NODE_ENV || 'development',

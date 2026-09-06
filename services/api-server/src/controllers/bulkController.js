@@ -427,26 +427,44 @@ const bulkDownloadZip = async (req, res, next) => {
     // Track duplicate filenames
     const usedNames = {};
     for (const file of accessibleFiles) {
-      let name = file.originalName || file.filename;
-      if (usedNames[name]) {
-        const ext = name.lastIndexOf('.') !== -1 ? name.slice(name.lastIndexOf('.')) : '';
-        const base = name.lastIndexOf('.') !== -1 ? name.slice(0, name.lastIndexOf('.')) : name;
-        name = `${base} (${usedNames[name]})${ext}`;
+      let rawName = (file.originalName || file.filename || 'file').replace(/\s+\./g, '.').trim();
+      let name = rawName;
+      if (usedNames[rawName]) {
+        const ext = rawName.lastIndexOf('.') !== -1 ? rawName.slice(rawName.lastIndexOf('.')) : '';
+        const base = rawName.lastIndexOf('.') !== -1 ? rawName.slice(0, rawName.lastIndexOf('.')) : rawName;
+        name = `${base} (${usedNames[rawName]})${ext}`;
       }
-      usedNames[file.originalName || file.filename] = (usedNames[file.originalName || file.filename] || 0) + 1;
+      usedNames[rawName] = (usedNames[rawName] || 0) + 1;
 
       if (file.totalChunks > 0) {
-        try {
-          await fs.access(file.storagePath);
-          archive.file(file.storagePath, { name });
-        } catch {
+        let streamedFromDisk = false;
+        if (file.storagePath && !file.storagePath.startsWith('chunked://')) {
+          try {
+            await fs.access(file.storagePath);
+            archive.file(file.storagePath, { name });
+            streamedFromDisk = true;
+          } catch {}
+        }
+        if (!streamedFromDisk) {
+          const { PassThrough } = require('stream');
+          const passThrough = new PassThrough();
+          archive.append(passThrough, { name });
           for (let i = 0; i < file.totalChunks; i++) {
-            const stream = await chunkService.getChunkStream(file._id, i);
-            archive.append(stream, { name: `${name}.part${i}` });
+            const chunkStream = await chunkService.getChunkStream(file._id, i);
+            await new Promise((resolve, reject) => {
+              chunkStream.pipe(passThrough, { end: i === file.totalChunks - 1 });
+              chunkStream.on('end', resolve);
+              chunkStream.on('error', (err) => {
+                passThrough.destroy(err);
+                reject(err);
+              });
+            });
           }
         }
-      } else {
+      } else if (file.storagePath && !file.storagePath.startsWith('chunked://')) {
         archive.file(file.storagePath, { name });
+      } else {
+        archive.append(Buffer.alloc(0), { name });
       }
     }
 

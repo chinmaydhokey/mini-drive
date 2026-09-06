@@ -1,11 +1,22 @@
 const path = require('path');
 const fs = require('fs').promises;
 const File = require('../models/File');
+const Folder = require('../models/Folder');
 const User = require('../models/User');
 const VersionHistory = require('../models/VersionHistory');
 const AppError = require('../utils/AppError');
 const cache = require('../services/cacheService');
 const chunkService = require('../services/chunkService');
+
+function buildContentDisposition(dispositionType, filename) {
+  const cleanName = (filename || 'download')
+    .replace(/["\r\n\\]/g, '_')
+    .replace(/\s+\./g, '.')
+    .trim();
+  const asciiFallback = cleanName.replace(/[^\x20-\x7E]/g, '_');
+  const encodedName = encodeURIComponent(cleanName);
+  return `${dispositionType}; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`;
+}
 
 /*
  * POST /api/files/upload
@@ -59,9 +70,28 @@ const uploadFile = async (req, res, next) => {
     try {
       const { totalChunks } = await chunkService.processAndUploadChunks(fileDoc._id, file.path);
       fileDoc.totalChunks = totalChunks;
+      fileDoc.status = 'AVAILABLE';
+      fileDoc.storagePath = `chunked://${req.storageKey}`;
       await fileDoc.save();
+
+      // Success: delete local temporary file
+      try {
+        await fs.unlink(file.path);
+        console.log(`🗑️ Local file deleted after successful replication: ${file.path}`);
+      } catch (unlinkErr) {
+        if (unlinkErr.code !== 'ENOENT') {
+          console.warn(`⚠️ Could not delete local file ${file.path}: ${unlinkErr.message}`);
+        }
+      }
     } catch (chunkErr) {
-      console.warn(`⚠️ Chunking error for file ${fileDoc._id} (falling back to local file): ${chunkErr.message}`);
+      // Chunking failed — mark for background reconciliation retry
+      console.warn(`⚠️ Chunking error for file ${fileDoc._id}, marking PENDING_REPLICATION: ${chunkErr.message}`);
+      fileDoc.status = 'PENDING_REPLICATION';
+      fileDoc.replicationAttempts = 0;
+      fileDoc.lastReplicationError = chunkErr.message;
+      fileDoc.nextReplicationRetry = new Date(); // eligible for immediate retry
+      // Keep storagePath pointing to local disk so reconciliation worker can find it
+      await fileDoc.save();
     }
     
     // Update user's storage usage
@@ -272,7 +302,7 @@ const downloadFile = async (req, res, next) => {
       _id: req.params.id,
       userId: req.user.userId,
       isDeleted: false,
-      status: 'AVAILABLE',
+      status: { $in: ['AVAILABLE', 'PENDING_REPLICATION'] },
     });
 
     // If not owner, check if user has DOWNLOAD permission via private share
@@ -282,13 +312,33 @@ const downloadFile = async (req, res, next) => {
         file = await File.findOne({
           _id: req.params.id,
           isDeleted: false,
-          status: 'AVAILABLE',
+          status: { $in: ['AVAILABLE', 'PENDING_REPLICATION'] },
         });
       }
     }
 
     if (!file) {
       throw new AppError('File not found or access denied.', 404);
+    }
+
+    // Handle PENDING_REPLICATION: serve from local disk if available
+    if (file.status === 'PENDING_REPLICATION') {
+      if (file.totalChunks === 0 && file.storagePath && !file.storagePath.startsWith('chunked://')) {
+        try {
+          await fs.access(file.storagePath);
+          // File exists locally — serve it directly
+        } catch {
+          throw new AppError(
+            'File is pending distribution to storage nodes. Please retry shortly.',
+            503
+          );
+        }
+      } else {
+        throw new AppError(
+          'File is pending distribution to storage nodes. Please retry shortly.',
+          503
+        );
+      }
     }
 
     // Verify file exists on disk (for non-chunked files)
@@ -305,10 +355,14 @@ const downloadFile = async (req, res, next) => {
     await file.save();
 
     // Set headers
+    const streamLength = file.isEncrypted && file.totalChunks > 0
+      ? file.size + (file.totalChunks * 16)
+      : file.size;
     res.set({
-      'Content-Type': file.mimeType,
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(file.originalName || file.filename)}"`,
-      'Content-Length': file.size,
+      'Content-Type': file.mimeType || 'application/octet-stream',
+      'Content-Disposition': buildContentDisposition('attachment', file.originalName || file.filename),
+      'Content-Length': streamLength,
+      'Accept-Ranges': 'bytes',
     });
 
     // If file is chunked, stream chunks in sequence (from storage nodes or S3 fallback)
@@ -626,7 +680,7 @@ const viewFile = async (req, res, next) => {
       _id: req.params.id,
       userId: req.user.userId,
       isDeleted: false,
-      status: 'AVAILABLE',
+      status: { $in: ['AVAILABLE', 'PENDING_REPLICATION'] },
     });
 
     // 2. If not owner, check if user has VIEW or DOWNLOAD permission via private share
@@ -636,13 +690,32 @@ const viewFile = async (req, res, next) => {
         file = await File.findOne({
           _id: req.params.id,
           isDeleted: false,
-          status: 'AVAILABLE',
+          status: { $in: ['AVAILABLE', 'PENDING_REPLICATION'] },
         });
       }
     }
 
     if (!file) {
       throw new AppError('File not found or access denied.', 404);
+    }
+
+    // Handle PENDING_REPLICATION: serve from local disk if available
+    if (file.status === 'PENDING_REPLICATION') {
+      if (file.totalChunks === 0 && file.storagePath && !file.storagePath.startsWith('chunked://')) {
+        try {
+          await fs.access(file.storagePath);
+        } catch {
+          throw new AppError(
+            'File is pending distribution to storage nodes. Please retry shortly.',
+            503
+          );
+        }
+      } else {
+        throw new AppError(
+          'File is pending distribution to storage nodes. Please retry shortly.',
+          503
+        );
+      }
     }
 
     // Verify file exists on disk (for non-chunked files)
@@ -655,11 +728,19 @@ const viewFile = async (req, res, next) => {
     }
 
     // Set headers for inline preview
+    const streamLength = file.isEncrypted && file.totalChunks > 0
+      ? file.size + (file.totalChunks * 16)
+      : file.size;
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
     res.set({
       'Content-Type': file.mimeType || 'application/octet-stream',
-      'Content-Disposition': `inline; filename="${encodeURIComponent(file.originalName || file.filename)}"`,
-      'Content-Length': file.size,
+      'Content-Disposition': buildContentDisposition('inline', file.originalName || file.filename),
+      'Content-Length': streamLength,
       'X-Content-Type-Options': 'nosniff',
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Cross-Origin-Embedder-Policy': 'unsafe-none',
+      'Accept-Ranges': 'bytes',
     });
 
     // If file is chunked, stream chunks in sequence
@@ -690,6 +771,171 @@ const viewFile = async (req, res, next) => {
   }
 };
 
+/**
+ * GET /api/files/:id/download-local
+ * Download a FAILED file's local copy (when replication exhausted retries).
+ * This allows the user to recover their data before the local file is cleaned up.
+ */
+const downloadFailedFile = async (req, res, next) => {
+  try {
+    const file = await File.findOne({
+      _id: req.params.id,
+      userId: req.user.userId,
+      status: 'FAILED',
+      isDeleted: false,
+    });
+
+    if (!file) {
+      throw new AppError('Failed file not found.', 404);
+    }
+
+    // Check if local file still exists
+    if (!file.storagePath || file.storagePath.startsWith('chunked://') || file.storagePath.startsWith('expired://')) {
+      throw new AppError('Local copy is no longer available. The file data has been cleaned up.', 410);
+    }
+
+    try {
+      await fs.access(file.storagePath);
+    } catch {
+      throw new AppError('Local copy is no longer available on this server.', 410);
+    }
+
+    // Mark that the user downloaded the local copy (starts 24h cleanup timer)
+    file.failedFileDownloadedAt = new Date();
+    await file.save();
+
+    // Stream file
+    const streamLength = file.size;
+    res.set({
+      'Content-Type': file.mimeType || 'application/octet-stream',
+      'Content-Disposition': buildContentDisposition('attachment', file.originalName || file.filename),
+      'Content-Length': streamLength,
+      'Accept-Ranges': 'bytes',
+    });
+
+    const fileStream = require('fs').createReadStream(file.storagePath);
+    fileStream.pipe(res);
+
+    fileStream.on('error', (err) => {
+      console.error('Failed file stream error:', err);
+      if (!res.headersSent) {
+        next(new AppError('Error reading file.', 500));
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * DELETE /api/files/:id/failed
+ * Delete a FAILED file record and its local copy immediately.
+ * Used when the user chooses "Delete and Retry" for a failed upload.
+ */
+const deleteFailedFile = async (req, res, next) => {
+  try {
+    const file = await File.findOne({
+      _id: req.params.id,
+      userId: req.user.userId,
+      status: 'FAILED',
+      isDeleted: false,
+    });
+
+    if (!file) {
+      throw new AppError('Failed file not found.', 404);
+    }
+
+    // Delete local file if it exists
+    if (file.storagePath && !file.storagePath.startsWith('chunked://') && !file.storagePath.startsWith('expired://')) {
+      try {
+        await fs.unlink(file.storagePath);
+        console.log(`🗑️ Deleted local FAILED file: ${file.storagePath}`);
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          console.warn(`⚠️ Could not delete local FAILED file: ${err.message}`);
+        }
+      }
+    }
+
+    // Delete any partial chunks from metadata service
+    try {
+      await chunkService.deleteChunks(file._id);
+    } catch {}
+
+    // Free storage quota
+    const user = await User.findById(file.userId);
+    if (user) {
+      user.storageUsed = Math.max(0, user.storageUsed - file.size);
+      await user.save();
+    }
+
+    // Hard-delete the file record (not soft-delete — it never successfully uploaded)
+    await File.deleteOne({ _id: file._id });
+
+    // Invalidate caches
+    await cache.invalidateFile(file.userId.toString(), file._id.toString(), file.folderId?.toString());
+
+    res.json({
+      success: true,
+      data: {
+        message: 'Failed file deleted. You can re-upload the file.',
+        fileId: file._id,
+        freedSpace: file.size,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/files/failed
+ * List all FAILED files for the current user (files that exhausted replication retries).
+ */
+const listFailedFiles = async (req, res, next) => {
+  try {
+    const files = await File.find({
+      userId: req.user.userId,
+      status: 'FAILED',
+      isDeleted: false,
+    })
+      .sort({ updatedAt: -1 })
+      .select('filename originalName mimeType size storagePath failedFileDownloadedAt lastReplicationError createdAt updatedAt');
+
+    // Check local availability for each file
+    const result = await Promise.all(
+      files.map(async (f) => {
+        let localAvailable = false;
+        if (f.storagePath && !f.storagePath.startsWith('chunked://') && !f.storagePath.startsWith('expired://')) {
+          try {
+            await fs.access(f.storagePath);
+            localAvailable = true;
+          } catch {}
+        }
+        return {
+          _id: f._id,
+          filename: f.filename,
+          originalName: f.originalName,
+          mimeType: f.mimeType,
+          size: f.size,
+          localAvailable,
+          alreadyDownloaded: !!f.failedFileDownloadedAt,
+          error: f.lastReplicationError,
+          createdAt: f.createdAt,
+          updatedAt: f.updatedAt,
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      data: { files: result, total: result.length },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   uploadFile,
   uploadNewVersion,
@@ -701,4 +947,7 @@ module.exports = {
   deleteFile,
   searchFiles,
   getStorageStats,
+  downloadFailedFile,
+  deleteFailedFile,
+  listFailedFiles,
 };
